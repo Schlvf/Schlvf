@@ -1,1 +1,1 @@
-![Devs POV](https://cdn.7tv.app/emote/60af8da952a13d1adb141008/4x.webp)
+![Devs POV](assets/smoge.gif)
