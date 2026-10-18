@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+sources=$(pactl list short sources | awk '$2 !~ /\.monitor$/ {print $1}')
+
+# If any microphone is unmuted, mute all of them.
+if echo "$sources" | while read -r id; do
+    pactl get-source-mute "$id" 2>/dev/null
+done | grep -q 'Mute: no'; then
+    echo "$sources" | while read -r id; do
+        pactl set-source-mute "$id" 1
+    done
+else
+    # Otherwise, unmute all microphones.
+    echo "$sources" | while read -r id; do
+        pactl set-source-mute "$id" 0
+    done
+fi

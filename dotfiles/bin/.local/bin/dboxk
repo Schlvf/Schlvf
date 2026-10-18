@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# dboxk - distrobox-like podman containers with an isolated $HOME.
+#
+# Each box shares the network, display and host podman socket with the host (no GPU), but gets its own home
+# directory (stored under $DBOXK_DATA/homes/<name>). The host $HOME is never
+# mounted. Works when run with bash or zsh (`dboxk ...`, `zsh dboxk ...`).
+#
+# Run it, do not `source` it (it uses `exit`).
+#
+# podman inside the box
+#   By default the host's rootless podman socket
+#   ($XDG_RUNTIME_DIR/podman/podman.sock) is mounted in the box and
+#   CONTAINER_HOST points to it. At creation, dboxk installs `podman-remote`
+#   in the box (dnf, apt-get or apk) and symlinks it as /usr/local/bin/podman,
+#   so `podman ...` inside the box talks to the HOST's podman: containers you
+#   start run on the host, and bind mounts (-v) refer to HOST paths.
+#   It is a symlink rather than a shell alias so it also works in scripts,
+#   Makefiles, compose, IDEs, etc.
+#   - The host needs the socket enabled: systemctl --user enable --now podman.socket
+#   - Anything that can use the socket can start a container that mounts the
+#     host $HOME, which defeats the home isolation. Use --no-podman-socket to
+#     opt out (then podman-remote is not installed either).
+#   - Installing podman-remote needs root capabilities, so --nosudo boxes
+#     (all capabilities dropped) don't get it.
+#
+# ssh into the box (remote editors such as Zed)
+#   By default dboxk installs openssh-server in the box and runs sshd as the
+#   box user (no root), key-only, on a stable per-name port (22000-22999)
+#   published on the host's 127.0.0.1 only (with --network host it listens on
+#   127.0.0.1 directly). Files live in the box home under ~/.dboxk (host key,
+#   authorized_keys, sshd_config, sshd.log). A dedicated client key is created
+#   once in $DBOXK_DATA/ssh/ and loaded in your ssh-agent on create/enter/ssh,
+#   so no manual key setup is needed. `dboxk ssh <name>` prints the commands.
+#   Disable with --nossh; not available with --nosudo or --network none.
+
+set -e
+
+DBOXK_DATA="${DBOXK_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/dboxk}"
+DBOXK_IMAGE="${DBOXK_IMAGE:-docker.io/library/fedora:44}"
+LABEL="io.dboxk.managed"
+SSH_LABEL="io.dboxk.ssh-port"
+SSH_KEY="$DBOXK_DATA/ssh/id_ed25519"
+# Run at container start: launch sshd if the box has been set up for it, then idle.
+SSHD_START='[ -x /usr/sbin/sshd ] && [ -f "$HOME/.dboxk/sshd_config" ] && /usr/sbin/sshd -f "$HOME/.dboxk/sshd_config" -E "$HOME/.dboxk/sshd.log"'
+
+die() { echo "dboxk: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Usage: dboxk <command> [options]
+
+Commands:
+  create <name> [options]   Create a box
+  enter  <name> [options] [-- cmd...]
+                            Start the box if needed and open a shell (or run cmd)
+  list                      List boxes
+  stop   <name>             Stop a box
+  ssh    <name>             Show how to connect over SSH (e.g. from Zed)
+  rm     <name> [options]   Remove a box (keeps its home unless --purge)
+
+create options:
+  --image IMG       Image (default: $DBOXK_IMAGE, or \$DBOXK_IMAGE)
+  --network MODE    pasta (default), host, none, bridge (bridge triggers an
+                    SELinux alert for nft/netavark on Fedora)
+  --no-podman-socket
+                    Do not share the host podman socket nor install podman-remote
+                    (see "podman inside the box" below)
+  --nogui           Do not share the Wayland/X11 sockets (shared by default so
+                    graphical apps work; rendering is in software, no GPU access)
+  --nosudo          Hardened box: no sudo, all capabilities dropped and
+                    no-new-privileges set. By default sudo (NOPASSWD) is installed
+                    and podman's default capabilities are kept.
+  --nossh           Do not set up sshd in the box (see "SSH" below)
+  --ssh-port N      Host port for ssh (default: stable per-name port in 22000-22999)
+  --keep-caps       With --nosudo, keep podman's default capabilities
+  --dry-run         Print the podman command and exit
+
+enter options:
+  --root            Run as container root (unprivileged on the host)
+
+rm options:
+  --purge           Also delete the box's home directory
+  -y, --yes         Do not ask for confirmation
+
+podman inside the box:
+  By default the host's podman socket is shared and 'podman-remote' is installed
+  in the box, symlinked as /usr/local/bin/podman. So 'podman' inside the box
+  controls the HOST's podman: containers run on the host and -v paths are HOST
+  paths. It needs 'systemctl --user enable --now podman.socket' on the host.
+  Whoever can use that socket can mount your host \$HOME in a new container, so
+  it weakens the home isolation. Not available with --nosudo or
+  --no-podman-socket.
+
+SSH (for remote editors such as Zed):
+  By default sshd runs inside the box as your user, key-only, reachable only on
+  localhost:<port>. dboxk generates a dedicated key ($DBOXK_DATA/ssh/id_ed25519),
+  authorizes it in the box and loads it in your ssh-agent, so
+  'zed ssh://<user>@localhost:<port>/<home>' works without any setup. Run
+  'dboxk ssh <name>' for the exact commands. The box's files stay in its own
+  home, not your host's. Not available with --nosudo, --nossh or --network none.
+
+Homes live in: $DBOXK_DATA/homes/<name>
+EOF
+}
+
+need_podman() { command -v podman >/dev/null 2>&1 || die "podman not found"; }
+
+check_name() {
+  case "$1" in
+    ""|-*|*[!A-Za-z0-9_.-]*) die "invalid name '$1' (use letters, digits, '_', '.', '-')" ;;
+  esac
+}
+
+home_of() { echo "$DBOXK_DATA/homes/$1"; }
+
+# True if a container with this name exists and was created by dboxk.
+is_managed() {
+  [ "$(podman container inspect -f "{{index .Config.Labels \"$LABEL\"}}" "$1" 2>/dev/null)" = "true" ]
+}
+
+is_running() {
+  [ "$(podman container inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]
+}
+
+# --- SSH (remote editors such as Zed) --------------------------------------
+
+ssh_port_in_use() {
+  if [ -n "$(podman ps -a -q --filter "label=$SSH_LABEL=$1")" ]; then return 0; fi
+  if command -v ss >/dev/null 2>&1 && [ -n "$(ss -ltnH "sport = :$1" 2>/dev/null)" ]; then return 0; fi
+  return 1
+}
+
+# Stable port derived from the name (22000-22999), skipping ports in use.
+pick_ssh_port() {
+  local p sum i=0
+  sum="$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+  p=$(( 22000 + sum % 1000 ))
+  while ssh_port_in_use "$p"; do
+    i=$(( i + 1 ))
+    if [ "$i" -ge 1000 ]; then die "no free ssh port found"; fi
+    p=$(( 22000 + (sum + i) % 1000 ))
+  done
+  echo "$p"
+}
+
+# Host-side prep of the files that live in the box home (~/.dboxk): sshd host
+# key, authorized_keys and sshd_config. Also creates, once, the dedicated
+# client key that is allowed to log in. Args: home_dir user port listen_addr
+ssh_prepare() {
+  local d="$1/.dboxk" kd
+  kd="$(dirname "$SSH_KEY")"
+  mkdir -p "$d" "$kd"
+  chmod 700 "$d" "$kd"
+  if [ ! -f "$SSH_KEY" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C dboxk -f "$SSH_KEY" || return 1
+  fi
+  if [ ! -f "$d/ssh_host_ed25519_key" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C dboxk-host -f "$d/ssh_host_ed25519_key" || return 1
+  fi
+  cp "$SSH_KEY.pub" "$d/authorized_keys"
+  chmod 600 "$d/authorized_keys"
+  # sshd runs as the box user (no root, no PAM): key auth only.
+  cat > "$d/sshd_config" <<EOF
+Port $3
+ListenAddress $4
+HostKey $HOME/.dboxk/ssh_host_ed25519_key
+AuthorizedKeysFile $HOME/.dboxk/authorized_keys
+PidFile $HOME/.dboxk/sshd.pid
+AllowUsers $2
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp internal-sftp
+EOF
+}
+
+# Load the dedicated key in the running ssh-agent (if any) so that plain
+# `ssh`/Zed connections to the boxes work without extra configuration.
+ssh_agent_add() {
+  if [ ! -f "$SSH_KEY" ] || [ -z "${SSH_AUTH_SOCK:-}" ] || ! command -v ssh-add >/dev/null 2>&1; then return 0; fi
+  if ssh-add -L 2>/dev/null | grep -qF "$(cut -d' ' -f2 "$SSH_KEY.pub")"; then return 0; fi
+  ssh-add -q "$SSH_KEY" 2>/dev/null || true
+}
+
+ssh_port_of() {
+  local v
+  v="$(podman container inspect -f "{{index .Config.Labels \"$SSH_LABEL\"}}" "$1" 2>/dev/null)" || true
+  case "$v" in ""|"<no value>") ;; *) echo "$v" ;; esac
+}
+
+# Provision the box as container root: sudo (+ NOPASSWD rule for the box user)
+# and podman-remote (symlinked as `podman`, so it also works in scripts).
+# Args: name user want_sudo want_remote want_ssh
+setup_box() {
+  podman start "$1" >/dev/null
+  podman exec -u 0 -e "DBOXK_USER=$2" -e "DBOXK_SUDO=$3" -e "DBOXK_REMOTE=$4" -e "DBOXK_SSH=$5" "$1" sh -c '
+    set -e
+    if [ -f /etc/dnf/dnf.conf ] && ! grep -q "^fastestmirror" /etc/dnf/dnf.conf; then
+      sed -i "/^\\[main\\]/a fastestmirror=True" /etc/dnf/dnf.conf
+    fi
+    pkgs=""
+    if [ "$DBOXK_SUDO" = 1 ] && ! command -v sudo >/dev/null 2>&1; then pkgs="$pkgs sudo"; fi
+    if [ "$DBOXK_REMOTE" = 1 ] && ! command -v podman-remote >/dev/null 2>&1; then pkgs="$pkgs podman-remote"; fi
+    if [ "$DBOXK_SSH" = 1 ] && [ ! -x /usr/sbin/sshd ]; then pkgs="$pkgs openssh-server"; fi
+    if [ -n "$pkgs" ]; then
+      if command -v dnf >/dev/null 2>&1; then dnf install -y $pkgs
+      elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y $pkgs
+      elif command -v apk >/dev/null 2>&1; then apk add $pkgs
+      else echo "no supported package manager to install:$pkgs" >&2; exit 1; fi
+    fi
+    if [ "$DBOXK_SUDO" = 1 ]; then
+      mkdir -p /etc/sudoers.d
+      printf "%s ALL=(ALL) NOPASSWD:ALL\n" "$DBOXK_USER" > /etc/sudoers.d/dboxk
+      chmod 440 /etc/sudoers.d/dboxk
+    fi
+    if [ "$DBOXK_REMOTE" = 1 ]; then
+      ln -sf "$(command -v podman-remote)" /usr/local/bin/podman
+    fi
+  '
+}
+
+cmd_create() {
+  local name="" image="$DBOXK_IMAGE" network="pasta" gui=1 keepcaps=0 dry=0 podsock=1 sudo=1 nossh=0 ssh_port_opt=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-podman-socket) podsock=0; shift ;;
+      --image)     [ $# -ge 2 ] || die "--image needs a value"; image="$2"; shift 2 ;;
+      --network)   [ $# -ge 2 ] || die "--network needs a value"; network="$2"; shift 2 ;;
+      --nogui)     gui=0; shift ;;
+      --keep-caps) keepcaps=1; shift ;;
+      --nosudo)    sudo=0; shift ;;
+      --nossh)     nossh=1; shift ;;
+      --ssh-port)  [ $# -ge 2 ] || die "--ssh-port needs a value"; ssh_port_opt="$2"; shift 2 ;;
+      --dry-run)   dry=1; shift ;;
+      -*)          die "unknown option '$1'" ;;
+      *)           [ -z "$name" ] || die "unexpected argument '$1'"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "create: missing <name>"
+  check_name "$name"
+  if podman container exists "$name"; then die "container '$name' already exists"; fi
+
+  local user_name uid rt home_dir
+  user_name="$(id -un)"
+  uid="$(id -u)"
+  rt="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+  home_dir="$(home_of "$name")"
+
+  # SSH needs root capabilities to install sshd, a network to publish the port
+  # on, and ssh-keygen on the host.
+  local want_ssh=1 ssh_port="" listen="0.0.0.0"
+  if [ "$nossh" -eq 1 ] || [ "$network" = none ]; then
+    want_ssh=0
+  elif [ "$sudo" -eq 0 ]; then
+    echo "dboxk: note: --nosudo boxes can't install sshd, so ssh was not enabled" >&2
+    want_ssh=0
+  elif ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "dboxk: note: ssh-keygen not found on the host, so ssh was not enabled" >&2
+    want_ssh=0
+  fi
+  if [ "$want_ssh" -eq 1 ]; then
+    if [ -n "$ssh_port_opt" ]; then
+      case "$ssh_port_opt" in *[!0-9]*|"") die "invalid --ssh-port '$ssh_port_opt'" ;; esac
+      ssh_port="$ssh_port_opt"
+    else
+      ssh_port="$(pick_ssh_port "$name")"
+    fi
+    if [ "$network" = host ]; then listen="127.0.0.1"; fi
+  fi
+
+  # The box home is mounted at the same path as the host $HOME, so the passwd
+  # entry podman generates for --userns=keep-id points at the isolated dir.
+  local args=(create
+    --name "$name" --hostname "$name" --init
+    --userns=keep-id
+    --network="$network"
+    # Needed so the container can talk to host sockets (dbus, wayland) under SELinux.
+    --security-opt=label=disable
+    --label "$LABEL=true"
+    --volume "${home_dir}:${HOME}:rw"
+    --workdir "$HOME"
+    --env "HOME=$HOME"
+    --env "USER=$user_name"
+    --env "XDG_RUNTIME_DIR=$rt"
+    # User-owned runtime dir (otherwise root-owned, and podman-remote can't write to it).
+    --tmpfs "${rt}:rw,mode=0700,U")
+
+  if [ "$want_ssh" -eq 1 ]; then
+    args+=(--label "$SSH_LABEL=$ssh_port")
+    # With host networking sshd listens on the host loopback directly.
+    if [ "$network" != host ]; then args+=(--publish "127.0.0.1:${ssh_port}:${ssh_port}"); fi
+  fi
+
+  # sudo is setuid and needs SETUID/SETGID, so sudo boxes keep default caps and
+  # skip no-new-privileges.
+  if [ "$sudo" -eq 0 ]; then args+=(--security-opt=no-new-privileges); fi
+  if [ "$sudo" -eq 0 ] && [ "$keepcaps" -eq 0 ]; then args+=(--cap-drop=all); fi
+
+  # --- Host podman service -------------------------------------------------
+  # NOTE: whoever can use this socket can start containers that mount the host
+  # $HOME, so it defeats the home isolation. Opt out with --no-podman-socket.
+  if [ "$podsock" -eq 1 ]; then
+    local sock="$rt/podman/podman.sock"
+    if [ -S "$sock" ]; then
+      args+=(--volume "${sock}:${sock}"
+             --env "CONTAINER_HOST=unix://$sock")
+    else
+      echo "dboxk: warning: $sock not found; run 'systemctl --user enable --now podman.socket' on the host" >&2
+    fi
+  fi
+
+  # --- Display (optional) --------------------------------------------------
+  if [ "$gui" -eq 1 ]; then
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$rt/$WAYLAND_DISPLAY" ]; then
+      args+=(--volume "$rt/$WAYLAND_DISPLAY:$rt/$WAYLAND_DISPLAY"
+             --env "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+    fi
+    if [ -d /tmp/.X11-unix ]; then
+      args+=(--volume /tmp/.X11-unix:/tmp/.X11-unix)
+      if [ -n "${DISPLAY:-}" ]; then args+=(--env "DISPLAY=$DISPLAY"); fi
+      if [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ]; then
+        args+=(--volume "${XAUTHORITY}:${XAUTHORITY}:ro" --env "XAUTHORITY=$XAUTHORITY")
+      fi
+    fi
+  fi
+
+  args+=("$image" sh -c "$SSHD_START; exec sleep infinity")
+
+  if [ "$dry" -eq 1 ]; then
+    printf 'mkdir -p %q\npodman' "$home_dir"
+    printf ' %q' "${args[@]}"
+    printf '\n'
+    return 0
+  fi
+
+  mkdir -p "$home_dir"
+  if [ "$want_ssh" -eq 1 ]; then
+    ssh_prepare "$home_dir" "$user_name" "$ssh_port" "$listen" || die "could not prepare ssh files"
+  fi
+  podman "${args[@]}" >/dev/null
+  # Package installs need root capabilities, which --nosudo boxes don't have.
+  local want_remote=0
+  if [ "$podsock" -eq 1 ]; then want_remote=1; fi
+  if [ "$sudo" -eq 0 ] && [ "$want_remote" -eq 1 ]; then
+    echo "dboxk: note: --nosudo boxes drop capabilities, so podman-remote was not installed" >&2
+    want_remote=0
+  fi
+  if [ "$sudo" -eq 1 ] || [ "$want_remote" -eq 1 ] || [ "$want_ssh" -eq 1 ]; then
+    setup_box "$name" "$user_name" "$sudo" "$want_remote" "$want_ssh" \
+      || die "provisioning failed; the box exists, inspect with: dboxk enter $name --root"
+  fi
+  if [ "$want_ssh" -eq 1 ]; then
+    # sshd was not installed when the container first started: start it now.
+    podman exec "$name" sh -c "$SSHD_START" || echo "dboxk: warning: could not start sshd (see ~/.dboxk/sshd.log in the box)" >&2
+    ssh_agent_add
+  fi
+  echo "Created '$name' (home: $home_dir). Enter it with: dboxk enter $name"
+  if [ "$want_ssh" -eq 1 ]; then echo "SSH enabled on localhost:$ssh_port. Details: dboxk ssh $name"; fi
+}
+
+cmd_enter() {
+  local name="" root=0 cmd=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) root=1; shift ;;
+      --)     shift; cmd=("$@"); break ;;
+      -*)     die "unknown option '$1'" ;;
+      *)      [ -z "$name" ] || die "unexpected argument '$1' (use -- before the command)"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "enter: missing <name>"
+  check_name "$name"
+  is_managed "$name" || die "'$name' is not a dboxk box"
+
+  if ! is_running "$name"; then podman start "$name" >/dev/null; fi
+  ssh_agent_add
+
+  local exec_args=(exec -i)
+  if [ -t 0 ] && [ -t 1 ]; then exec_args+=(-t); fi
+  if [ "$root" -eq 1 ]; then
+    exec_args+=(-u 0 -w /root --env HOME=/root)
+  else
+    exec_args+=(-w "$HOME")
+  fi
+  if [ "${#cmd[@]}" -eq 0 ]; then cmd=(bash -l); fi
+
+  exec podman "${exec_args[@]}" "$name" "${cmd[@]}"
+}
+
+cmd_ssh() {
+  [ $# -eq 1 ] || die "ssh: expected <name>"
+  check_name "$1"
+  is_managed "$1" || die "'$1' is not a dboxk box"
+  local port user_name
+  port="$(ssh_port_of "$1")"
+  [ -n "$port" ] || die "ssh is not enabled for '$1' (create it without --nossh/--nosudo)"
+  if ! is_running "$1"; then podman start "$1" >/dev/null; fi
+  ssh_agent_add
+  user_name="$(id -un)"
+  cat <<EOF
+SSH for '$1' (listens on localhost only; key-only login):
+  Zed:      zed ssh://$user_name@localhost:$port$HOME
+  Terminal: ssh -p $port -i $SSH_KEY -o IdentitiesOnly=yes $user_name@localhost
+The dedicated key is loaded in your ssh-agent (re-run 'dboxk ssh $1' after a
+login/reboot if the agent was restarted). Without an agent, add to Zed's
+settings.json:
+  "ssh_connections": [{ "host": "localhost", "port": $port, "username": "$user_name",
+                        "args": ["-i", "$SSH_KEY"] }]
+EOF
+}
+
+cmd_list() {
+  podman ps -a --filter "label=$LABEL=true" \
+    --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+}
+
+cmd_stop() {
+  [ $# -eq 1 ] || die "stop: expected <name>"
+  check_name "$1"
+  is_managed "$1" || die "'$1' is not a dboxk box"
+  podman stop "$1" >/dev/null
+  echo "Stopped '$1'"
+}
+
+cmd_rm() {
+  local name="" purge=0 yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge)  purge=1; shift ;;
+      -y|--yes) yes=1; shift ;;
+      -*)       die "unknown option '$1'" ;;
+      *)        [ -z "$name" ] || die "unexpected argument '$1'"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "rm: missing <name>"
+  check_name "$name"
+
+  local home_dir
+  home_dir="$(home_of "$name")"
+
+  if podman container exists "$name"; then
+    is_managed "$name" || die "'$name' is not a dboxk box, refusing to remove it"
+  elif [ "$purge" -eq 0 ] || [ ! -d "$home_dir" ]; then
+    die "box '$name' does not exist"
+  fi
+
+  if [ "$yes" -eq 0 ]; then
+    local msg="Remove box '$name'"
+    if [ "$purge" -eq 1 ]; then
+      msg="$msg AND delete its home $home_dir ($(du -sh "$home_dir" 2>/dev/null | cut -f1))"
+    fi
+    printf '%s? [y/N] ' "$msg"
+    local reply=""
+    read -r reply || true
+    case "$reply" in y|Y|yes|YES) ;; *) echo "Aborted"; return 1 ;; esac
+  fi
+
+  local port=""
+  if podman container exists "$name"; then
+    port="$(ssh_port_of "$name")"
+    podman rm -f -t 0 "$name" >/dev/null
+  fi
+
+  if [ "$purge" -eq 1 ] && [ -d "$home_dir" ]; then
+    # Files created by container-root are owned by subuids: delete inside the userns.
+    podman unshare rm -rf -- "$home_dir"
+    # Its sshd host key is gone: drop the stale known_hosts entries.
+    if [ -n "$port" ] && command -v ssh-keygen >/dev/null 2>&1; then
+      ssh-keygen -R "[localhost]:$port" >/dev/null 2>&1 || true
+      ssh-keygen -R "[127.0.0.1]:$port" >/dev/null 2>&1 || true
+    fi
+    echo "Removed '$name' and its home"
+  else
+    echo "Removed '$name' (home kept at $home_dir)"
+  fi
+}
+
+main() {
+  [ $# -ge 1 ] || { usage; exit 1; }
+  local sub="$1"; shift
+  case "$sub" in
+    -h|--help|help) usage; return 0 ;;
+  esac
+  need_podman
+  case "$sub" in
+    create)       cmd_create "$@" ;;
+    enter)        cmd_enter "$@" ;;
+    list|ls)      cmd_list "$@" ;;
+    stop)         cmd_stop "$@" ;;
+    ssh)          cmd_ssh "$@" ;;
+    rm|remove)    cmd_rm "$@" ;;
+    *)            usage; exit 1 ;;
+  esac
+}
+
+main "$@"

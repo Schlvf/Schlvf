@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+if dunstctl is-paused | grep -q "true"; then
+    dunstctl set-paused false
+    notify-send -u normal "DND disabled" "Notifications are enabled."
+else
+    notify-send -u normal "DND enabled" "Notifications are paused."
+    sleep 0.5
+    dunstctl set-paused true
+fi
