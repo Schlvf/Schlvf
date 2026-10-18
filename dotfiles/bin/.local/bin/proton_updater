@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# --- Cross-shell compatibility ------------------------------------
+if [ -n "${ZSH_VERSION:-}" ]; then
+    setopt LOCAL_OPTIONS
+    setopt NULL_GLOB
+    setopt SH_WORD_SPLIT
+    setopt KSH_ARRAYS
+else
+    shopt -s nullglob
+fi
+
+# ------------------------------
+# CONFIG
+# ------------------------------
+REPO_API="https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
+# COMPAT_DIR="$HOME/.steam/steam/compatibilitytools.d" # Native steam
+COMPAT_DIR="$HOME/.var/app/com.valvesoftware.Steam/.steam/steam/compatibilitytools.d" # Flatpak steam
+TMP_DIR="/tmp/proton-ge-custom"
+
+# ------------------------------
+# Ensure Steam compatibility dir exists
+# ------------------------------
+echo "Using compatibility tools directory:"
+echo " → $COMPAT_DIR"
+mkdir -p "$COMPAT_DIR"
+echo
+
+# ------------------------------
+# Detect currently installed latest version (if any)
+# ------------------------------
+cd "$COMPAT_DIR"
+
+INSTALLED_VERSIONS=(GE-Proton*)
+CURRENT_LATEST="none"
+
+if [ ${#INSTALLED_VERSIONS[@]} -gt 0 ]; then
+    CURRENT_LATEST="${INSTALLED_VERSIONS[-1]}"
+fi
+
+# ------------------------------
+# Fetch latest online release tag
+# ------------------------------
+echo "Fetching latest Proton-GE version online..."
+LATEST_TAG=$(curl -s "$REPO_API" | grep '"tag_name"' | cut -d '"' -f4)
+
+if [ -z "$LATEST_TAG" ]; then
+    echo "Failed to retrieve latest version tag from GitHub. Exiting."
+    exit 1
+fi
+
+echo "Latest available online:  $LATEST_TAG"
+echo "Currently installed:      $CURRENT_LATEST"
+echo
+
+# ------------------------------
+# Check if already up-to-date
+# ------------------------------
+if [ "$CURRENT_LATEST" = "$LATEST_TAG" ]; then
+    echo "✔ You already have the latest version installed."
+    exit 0
+fi
+
+# ------------------------------
+# Ask user if they want to update
+# ------------------------------
+echo "A newer version is available."
+printf "Do you want to download and install %s? (y/N): " "$LATEST_TAG"
+read -r CONFIRM
+
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Update canceled. Exiting."
+    exit 0
+fi
+
+echo
+echo "Proceeding with update..."
+echo
+
+# ------------------------------
+# Prepare temporary directory
+# ------------------------------
+echo "Creating temporary working directory..."
+rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR"
+cd "$TMP_DIR"
+
+# ------------------------------
+# Fetch tarball + checksum
+# ------------------------------
+echo "Retrieving tarball URL..."
+JSON=$(curl -fsSL "$REPO_API")
+
+TARBALL_URL=$(
+    jq -r '
+        .assets[]
+        | select(.name | endswith(".tar.gz"))
+        | select(.name | contains("aarch64") | not)
+        | .browser_download_url
+    ' <<<"$JSON"
+)
+
+CHECKSUM_URL=$(
+    jq -r '
+        .assets[]
+        | select(.name | endswith(".sha512sum"))
+        | select(.name | contains("aarch64") | not)
+        | .browser_download_url
+    ' <<<"$JSON"
+)
+
+TARBALL_NAME=$(basename "$TARBALL_URL")
+CHECKSUM_NAME=$(basename "$CHECKSUM_URL")
+
+echo "Downloading Proton-GE: $TARBALL_NAME"
+curl -L --progress-bar "$TARBALL_URL" -o "$TARBALL_NAME"
+
+echo "Downloading checksum: $CHECKSUM_NAME"
+curl -L --progress-bar "$CHECKSUM_URL" -o "$CHECKSUM_NAME"
+
+# ------------------------------
+# Verify checksum
+# ------------------------------
+echo "Verifying tarball..."
+sha512sum -c "$CHECKSUM_NAME"
+
+echo "Checksum OK!"
+echo
+
+# ------------------------------
+# Extract to Steam directory
+# ------------------------------
+echo "Installing Proton-GE into: $COMPAT_DIR"
+mkdir -p "$COMPAT_DIR"
+tar -xf "$TARBALL_NAME" -C "$COMPAT_DIR"
+
+echo
+echo "✔ Installed: $LATEST_TAG"
+echo
+
+# ------------------------------
+# Keep only latest 3 versions
+# ------------------------------
+echo "Cleaning old versions (keeping latest 3)..."
+
+cd "$COMPAT_DIR"
+INSTALLED=(GE-Proton*)
+COUNT=${#INSTALLED[@]}
+
+if [ "$COUNT" -gt 3 ]; then
+    REMOVE_COUNT=$((COUNT - 3))
+
+    for ((i=0; i<REMOVE_COUNT; i++)); do
+        echo "Removing old version: ${INSTALLED[$i]}"
+        rm -rf "${INSTALLED[$i]}"
+    done
+else
+    echo "No old versions to remove."
+fi
+
+echo
+echo "All done!"
+echo "You now have the latest Proton-GE installed: $LATEST_TAG"
