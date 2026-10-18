@@ -12,7 +12,7 @@ On Fedora , Stow can be installed with `sudo dnf install stow`
 
 Each directory is a Stow package that mirrors paths inside $HOME.
 
-  - **sway/, waybar/, foot/, dunst/, pipewire/**: application configurations
+  - **sway/, waybar/, foot/, dunst/, pipewire/, mangohud/**: application configurations
   - **shell/**: Zsh configuration
   - **bin/**: personal scripts and executables
   - **lib/**: local libraries, including the RNNoise LADSPA plugin
@@ -23,11 +23,11 @@ Clone the repository, then back up any existing configuration files that conflic
 
 Apply all packages:
 
-`stow --target="$HOME" sway waybar foot dunst pipewire shell bin lib`
+`stow --target="$HOME" sway waybar foot dunst pipewire shell bin lib mangohud`
 
 Preview changes before applying:
 
-`stow --simulate --verbose --target="$HOME" sway waybar foot dunst pipewire shell bin lib`
+`stow --simulate --verbose --target="$HOME" sway waybar foot dunst pipewire shell bin lib mangohud`
 
 To manage only one package:
 
