@@ -32,6 +32,15 @@
 #   once in $DBOXK_DATA/ssh/ and loaded in your ssh-agent on create/enter/ssh,
 #   so no manual key setup is needed. `dboxk ssh <name>` prints the commands.
 #   Disable with --nossh; not available with --nosudo or --network none.
+#
+# Desktop notifications
+#   Like flatpak, by default each box gets a filtered D-Bus socket from a host
+#   xdg-dbus-proxy that only allows org.freedesktop.Notifications.Notify on the
+#   host session bus (nothing else on the bus is reachable). The socket is
+#   mounted at /run/dboxk/notify-bus and $DBOXK_NOTIFY_BUS holds its address.
+#   dboxk starts the proxy whenever it starts the box (create/enter/ssh) and
+#   stops it on stop/rm; a box started with plain `podman start` has no
+#   notifications until the next `dboxk enter`. Disable with --nonotify.
 
 set -e
 
@@ -40,6 +49,8 @@ DBOXK_IMAGE="${DBOXK_IMAGE:-docker.io/library/fedora:44}"
 LABEL="io.dboxk.managed"
 SSH_LABEL="io.dboxk.ssh-port"
 SSH_KEY="$DBOXK_DATA/ssh/id_ed25519"
+NOTIFY_LABEL="io.dboxk.notify"
+NOTIFY_DIR="/run/dboxk"
 # Run at container start: launch sshd if the box has been set up for it, then idle.
 SSHD_START='[ -x /usr/sbin/sshd ] && [ -f "$HOME/.dboxk/sshd_config" ] && /usr/sbin/sshd -f "$HOME/.dboxk/sshd_config" -E "$HOME/.dboxk/sshd.log"'
 
@@ -71,6 +82,7 @@ create options:
                     no-new-privileges set. By default sudo (NOPASSWD) is installed
                     and podman's default capabilities are kept.
   --nossh           Do not set up sshd in the box (see "SSH" below)
+  --nonotify        Do not expose the notification socket (see "Notifications")
   --ssh-port N      Host port for ssh (default: stable per-name port in 22000-22999)
   --keep-caps       With --nosudo, keep podman's default capabilities
   --dry-run         Print the podman command and exit
@@ -98,6 +110,16 @@ SSH (for remote editors such as Zed):
   'zed ssh://<user>@localhost:<port>/<home>' works without any setup. Run
   'dboxk ssh <name>' for the exact commands. The box's files stay in its own
   home, not your host's. Not available with --nosudo, --nossh or --network none.
+
+Notifications:
+  Like flatpak, dboxk runs an xdg-dbus-proxy on the host for each box (started
+  by create/enter/ssh, stopped by stop/rm) whose socket is mounted in the box.
+  It only allows sending desktop notifications; the rest of the host session
+  bus is unreachable. From the box:
+    busctl --address="\$DBOXK_NOTIFY_BUS" -- call \\
+      org.freedesktop.Notifications /org/freedesktop/Notifications \\
+      org.freedesktop.Notifications Notify susssasa{sv}i app 0 "" Title Body 0 0 -1
+  Needs xdg-dbus-proxy on the host. Disable with --nonotify.
 
 Homes live in: $DBOXK_DATA/homes/<name>
 EOF
@@ -193,6 +215,64 @@ ssh_port_of() {
   case "$v" in ""|"<no value>") ;; *) echo "$v" ;; esac
 }
 
+# --- Notifications ----------------------------------------------------------
+
+# Like flatpak, the box never sees the host session bus: dboxk runs one
+# xdg-dbus-proxy per box on the host that only forwards Notify, and its socket
+# dir (host-only, under $DBOXK_DATA) is mounted in the box at $NOTIFY_DIR. The
+# pidfile lives outside that dir so the box can't make dboxk kill another pid.
+
+notify_dir_of() { echo "$DBOXK_DATA/notify/$1"; }
+notify_pidfile_of() { echo "$DBOXK_DATA/notify/$1.pid"; }
+
+# Pid of the box's running proxy, if any (checked against /proc, so a stale
+# pidfile after a reboot never matches an unrelated process).
+notify_pid() {
+  local pid sock cmd
+  pid="$(cat "$(notify_pidfile_of "$1")" 2>/dev/null)" || return 1
+  sock="$(notify_dir_of "$1")/notify-bus"
+  case "$pid" in ""|*[!0-9]*) return 1 ;; esac
+  cmd="$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline")" || return 1
+  case "$cmd" in "xdg-dbus-proxy "*" $sock "*) ;; *) return 1 ;; esac
+  echo "$pid"
+}
+
+# Start the box's proxy unless it is running or the box was created --nonotify.
+notify_start() {
+  local v dir sock bus i=0
+  v="$(podman container inspect -f "{{index .Config.Labels \"$NOTIFY_LABEL\"}}" "$1" 2>/dev/null)" || true
+  [ "$v" = "true" ] || return 0
+  if notify_pid "$1" >/dev/null; then return 0; fi
+  if ! command -v xdg-dbus-proxy >/dev/null 2>&1; then
+    echo "dboxk: warning: xdg-dbus-proxy not found on the host, so notifications are disabled" >&2
+    return 0
+  fi
+  dir="$(notify_dir_of "$1")"
+  sock="$dir/notify-bus"
+  bus="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
+  mkdir -p "$dir"
+  rm -f "$sock"
+  # setsid: survive the terminal closing and dboxk exec'ing podman.
+  setsid xdg-dbus-proxy "$bus" "$sock" --filter \
+    --call=org.freedesktop.Notifications=org.freedesktop.Notifications.Notify@/org/freedesktop/Notifications \
+    </dev/null >/dev/null 2>&1 &
+  echo "$!" > "$(notify_pidfile_of "$1")"
+  while [ ! -S "$sock" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$(( i + 1 )); done
+  if [ ! -S "$sock" ]; then echo "dboxk: warning: the notification proxy did not start" >&2; fi
+}
+
+notify_stop() {
+  local pid
+  if pid="$(notify_pid "$1")"; then kill "$pid" 2>/dev/null || true; fi
+  rm -f "$(notify_pidfile_of "$1")" "$(notify_dir_of "$1")/notify-bus"
+}
+
+# Start the box (if needed) and its notification proxy.
+start_box() {
+  if ! is_running "$1"; then podman start "$1" >/dev/null; fi
+  notify_start "$1"
+}
+
 # Provision the box as container root: sudo (+ NOPASSWD rule for the box user)
 # and podman-remote (symlinked as `podman`, so it also works in scripts).
 # Args: name user want_sudo want_remote want_ssh
@@ -225,7 +305,7 @@ setup_box() {
 }
 
 cmd_create() {
-  local name="" image="$DBOXK_IMAGE" network="pasta" gui=1 keepcaps=0 dry=0 podsock=1 sudo=1 nossh=0 ssh_port_opt=""
+  local name="" image="$DBOXK_IMAGE" network="pasta" gui=1 keepcaps=0 dry=0 podsock=1 sudo=1 nossh=0 ssh_port_opt="" notify=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-podman-socket) podsock=0; shift ;;
@@ -235,6 +315,7 @@ cmd_create() {
       --keep-caps) keepcaps=1; shift ;;
       --nosudo)    sudo=0; shift ;;
       --nossh)     nossh=1; shift ;;
+      --nonotify)  notify=0; shift ;;
       --ssh-port)  [ $# -ge 2 ] || die "--ssh-port needs a value"; ssh_port_opt="$2"; shift 2 ;;
       --dry-run)   dry=1; shift ;;
       -*)          die "unknown option '$1'" ;;
@@ -290,6 +371,12 @@ cmd_create() {
     # User-owned runtime dir (otherwise root-owned, and podman-remote can't write to it).
     --tmpfs "${rt}:rw,mode=0700,U")
 
+  if [ "$notify" -eq 1 ]; then
+    args+=(--label "$NOTIFY_LABEL=true"
+           --volume "$(notify_dir_of "$name"):$NOTIFY_DIR"
+           --env "DBOXK_NOTIFY_BUS=unix:path=$NOTIFY_DIR/notify-bus")
+  fi
+
   if [ "$want_ssh" -eq 1 ]; then
     args+=(--label "$SSH_LABEL=$ssh_port")
     # With host networking sshd listens on the host loopback directly.
@@ -332,7 +419,9 @@ cmd_create() {
   args+=("$image" sh -c "$SSHD_START; exec sleep infinity")
 
   if [ "$dry" -eq 1 ]; then
-    printf 'mkdir -p %q\npodman' "$home_dir"
+    printf 'mkdir -p %q' "$home_dir"
+    if [ "$notify" -eq 1 ]; then printf ' %q' "$(notify_dir_of "$name")"; fi
+    printf '\npodman'
     printf ' %q' "${args[@]}"
     printf '\n'
     return 0
@@ -342,6 +431,7 @@ cmd_create() {
   if [ "$want_ssh" -eq 1 ]; then
     ssh_prepare "$home_dir" "$user_name" "$ssh_port" "$listen" || die "could not prepare ssh files"
   fi
+  if [ "$notify" -eq 1 ]; then mkdir -p "$(notify_dir_of "$name")"; fi
   podman "${args[@]}" >/dev/null
   # Package installs need root capabilities, which --nosudo boxes don't have.
   local want_remote=0
@@ -359,6 +449,7 @@ cmd_create() {
     podman exec "$name" sh -c "$SSHD_START" || echo "dboxk: warning: could not start sshd (see ~/.dboxk/sshd.log in the box)" >&2
     ssh_agent_add
   fi
+  notify_start "$name"
   echo "Created '$name' (home: $home_dir). Enter it with: dboxk enter $name"
   if [ "$want_ssh" -eq 1 ]; then echo "SSH enabled on localhost:$ssh_port. Details: dboxk ssh $name"; fi
 }
@@ -377,7 +468,7 @@ cmd_enter() {
   check_name "$name"
   is_managed "$name" || die "'$name' is not a dboxk box"
 
-  if ! is_running "$name"; then podman start "$name" >/dev/null; fi
+  start_box "$name"
   ssh_agent_add
 
   local exec_args=(exec -i)
@@ -399,7 +490,7 @@ cmd_ssh() {
   local port user_name
   port="$(ssh_port_of "$1")"
   [ -n "$port" ] || die "ssh is not enabled for '$1' (create it without --nossh/--nosudo)"
-  if ! is_running "$1"; then podman start "$1" >/dev/null; fi
+  start_box "$1"
   ssh_agent_add
   user_name="$(id -un)"
   cat <<EOF
@@ -424,6 +515,7 @@ cmd_stop() {
   check_name "$1"
   is_managed "$1" || die "'$1' is not a dboxk box"
   podman stop "$1" >/dev/null
+  notify_stop "$1"
   echo "Stopped '$1'"
 }
 
@@ -465,6 +557,9 @@ cmd_rm() {
     port="$(ssh_port_of "$name")"
     podman rm -f -t 0 "$name" >/dev/null
   fi
+  notify_stop "$name"
+  # The box can write there (as container root, owned by subuids).
+  podman unshare rm -rf -- "$(notify_dir_of "$name")"
 
   if [ "$purge" -eq 1 ] && [ -d "$home_dir" ]; then
     # Files created by container-root are owned by subuids: delete inside the userns.
